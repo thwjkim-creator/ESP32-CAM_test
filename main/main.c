@@ -37,20 +37,17 @@
 /* ═══════════════════════════════════════════════════════════
  *  Configuration — edit these for your environment
  * ═══════════════════════════════════════════════════════════ */
-// 2.4GHz Wi-Fi credentials
-#define WIFI_SSID              "WIFI_SSID"  // Change please
-#define WIFI_PASS              "WIFI_PASS"  // Change please
+#define WIFI_SSID              "YS_Start_Up_03"
+#define WIFI_PASS              "ys000003"
 
-// HTTP POST URL (Change localhost to your server IP/domain)
-#define HTTP_POST_URL          "http://localhost/upload" // Change please
-#define MQTT_BROKER_URI        "mqtt://localhost:1883"  // Change please
+#define HTTP_POST_URL          "http://172.21.101.29:8080/upload"
+#define MQTT_BROKER_URI        "mqtt://172.21.101.29:1883"
 #define MQTT_TOPIC_LUX         "sensor/veml7700/lux"
 #define MQTT_TOPIC_STATUS      "sensor/veml7700/status"
 #define MQTT_LWT_MSG           "{\"status\":\"offline\"}"
 #define MQTT_ONLINE_MSG        "{\"status\":\"online\"}"
 
-#define CAMERA_PERIOD_MS       10000 // 10 seconds - Change please
-#define SENSOR_PERIOD_MS       10000 // 10 seconds - Change please
+#define TASK_PERIOD_MS         10000   /* 카메라 + 센서 공통 주기 (10초) */
 
 /* ═══════════════════════════════════════════════════════════ */
 
@@ -132,6 +129,10 @@ static void wait_for_wifi(void)
 
 static void sntp_init_time(void)
 {
+    /* KST 타임존 설정 (localtime_r에서 자동 적용) */
+    setenv("TZ", "KST-9", 1);
+    tzset();
+
     ESP_LOGI(TAG, "Initialising SNTP …");
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
@@ -203,27 +204,56 @@ static void mqtt_init(void)
 
 /* ────────────────── Timestamp helper ─────────────────────── */
 
-static void get_iso_timestamp(char *buf, size_t len)
+static void get_kst_timestamp(char *buf, size_t len)
 {
     time_t now;
     struct tm ti;
     time(&now);
-    gmtime_r(&now, &ti);
-    strftime(buf, len, "%Y-%m-%dT%H:%M:%SZ", &ti);
+    localtime_r(&now, &ti);
+    strftime(buf, len, "%Y-%m-%dT%H:%M:%S+09:00", &ti);
 }
 
-/* ────────────────── Camera task ──────────────────────────── */
+/* ────────────────── Unified sensor + camera task ────────── */
 
-static void camera_task(void *arg)
+static void sensor_camera_task(void *arg)
 {
-    char ts[32];
+    char ts[40];
+    char payload[128];
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(CAMERA_PERIOD_MS));
+        vTaskDelay(pdMS_TO_TICKS(TASK_PERIOD_MS));
 
-        /* Acquire I2C mutex while capturing (camera uses SCCB internally) */
+        /* ── 1. 타임스탬프 한 번만 생성 (카메라 + 조도 공유) ── */
+        get_kst_timestamp(ts, sizeof(ts));
+
+        /* ── 2. 조도 측정 ── */
+        float lux = 0.0f;
+        bool lux_ok = false;
+        esp_err_t ret = veml7700_read_lux(&lux);
+        if (ret == ESP_OK) {
+            lux_ok = true;
+            snprintf(payload, sizeof(payload),
+                     "{\"lux\":%.2f,\"timestamp\":\"%s\"}", lux, ts);
+
+            ESP_LOGI(TAG, "Lux=%.2f  ts=%s", lux, ts);
+
+            if (s_mqtt_connected) {
+                int msg_id = esp_mqtt_client_publish(
+                    s_mqtt_client, MQTT_TOPIC_LUX,
+                    payload, 0, /*qos*/1, /*retain*/0);
+                if (msg_id < 0) {
+                    ESP_LOGW(TAG, "MQTT publish failed");
+                }
+            } else {
+                ESP_LOGW(TAG, "MQTT not connected, skipping publish");
+            }
+        } else {
+            ESP_LOGW(TAG, "Lux read failed: %s", esp_err_to_name(ret));
+        }
+
+        /* ── 3. 카메라 촬영 ── */
         if (xSemaphoreTake(s_i2c_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
-            ESP_LOGW(TAG, "camera_task: mutex timeout");
+            ESP_LOGW(TAG, "camera: mutex timeout");
             continue;
         }
 
@@ -235,7 +265,6 @@ static void camera_task(void *arg)
             continue;
         }
 
-        get_iso_timestamp(ts, sizeof(ts));
         ESP_LOGI(TAG, "JPEG captured: %u bytes  ts=%s", (unsigned)fb->len, ts);
 
         /* HTTP POST */
@@ -259,42 +288,6 @@ static void camera_task(void *arg)
 
         esp_http_client_cleanup(client);
         esp_camera_fb_return(fb);
-    }
-}
-
-/* ────────────────── Sensor task ──────────────────────────── */
-
-static void sensor_task(void *arg)
-{
-    char payload[128];
-    char ts[32];
-
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_PERIOD_MS));
-
-        float lux = 0.0f;
-        esp_err_t ret = veml7700_read_lux(&lux);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Lux read failed: %s", esp_err_to_name(ret));
-            continue;
-        }
-
-        get_iso_timestamp(ts, sizeof(ts));
-        snprintf(payload, sizeof(payload),
-                 "{\"lux\":%.2f,\"timestamp\":\"%s\"}", lux, ts);
-
-        ESP_LOGI(TAG, "Lux=%.2f  → MQTT", lux);
-
-        if (s_mqtt_connected) {
-            int msg_id = esp_mqtt_client_publish(
-                s_mqtt_client, MQTT_TOPIC_LUX,
-                payload, 0, /*qos*/1, /*retain*/0);
-            if (msg_id < 0) {
-                ESP_LOGW(TAG, "MQTT publish failed");
-            }
-        } else {
-            ESP_LOGW(TAG, "MQTT not connected, skipping publish");
-        }
     }
 }
 
@@ -334,11 +327,9 @@ void app_main(void)
     /* Small delay for MQTT connect before tasks start publishing */
     vTaskDelay(pdMS_TO_TICKS(2000));
 
-    /* ─── 6. Launch FreeRTOS tasks ─── */
-    xTaskCreatePinnedToCore(camera_task, "camera_task",
+    /* ─── 6. Launch unified task ─── */
+    xTaskCreatePinnedToCore(sensor_camera_task, "sensor_camera_task",
                             8192, NULL, 5, NULL, 0);
-    xTaskCreatePinnedToCore(sensor_task, "sensor_task",
-                            4096, NULL, 5, NULL, 1);
 
-    ESP_LOGI(TAG, "All tasks launched ✓");
+    ESP_LOGI(TAG, "Task launched ✓");
 }

@@ -73,8 +73,7 @@ def mqtt_thread():
 #  타임스탬프 매칭
 # ══════════════════════════════════════════════
 def parse_ts(ts_str):
-    """ISO 8601 문자열 → datetime"""
-    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S"):
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S"):
         try:
             return datetime.strptime(ts_str, fmt)
         except ValueError:
@@ -126,6 +125,8 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[HTTP] 사진 저장: {filename} ({len(data)} bytes)")
 
         self.send_response(200)
+        self.send_header("Content-Length", "2")
+        
         self.end_headers()
         self.wfile.write(b"OK")
 
